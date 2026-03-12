@@ -1,147 +1,202 @@
+# backend/news_service.py
+import os
+import re
 import requests
 import pandas as pd
-import re
-import os
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
 
-# ==============================
-# Configuration
-# ==============================
-API_KEY = "8f699a3ccdb149abb366f107cb93ba24"   # <-- put your NewsAPI key here
+load_dotenv()
 
-DATA_DIR = "data"
-RAW_FILE = os.path.join(DATA_DIR, "news_data.csv")
-CLEAN_FILE = os.path.join(DATA_DIR, "news_data_cleaned.csv")
+API_KEY      = os.getenv("NEWS_API_KEY")
+DATA_DIR     = "data"
+RAW_FILE     = os.path.join(DATA_DIR, "news_raw.csv")
+CLEANED_FILE = os.path.join(DATA_DIR, "news_data_cleaned.csv")
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
+DEFAULT_TOPICS = [
+    "technology", "politics", "business",
+    "health", "science", "sports",
+    "entertainment", "world"
+]
 
 # ==============================
-# Fetch Recent News (Day 3–4)
+# Fetch single topic
 # ==============================
-def fetch_news(query="technology", total_articles=60):
+def fetch_news(query="technology", total_articles=100):
+    if not API_KEY:
+        raise ValueError("NEWS_API_KEY not set in .env")
+
     news_list = []
-    page = 1
-    page_size = 20
-
-    # Last 24 hours
-    from_date = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+    page      = 1
+    from_date = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
 
     while len(news_list) < total_articles:
-        url = (
-            f"https://newsapi.org/v2/everything?"
-            f"q={query}&"
-            f"from={from_date}&"
-            f"sortBy=publishedAt&"
-            f"language=en&"
-            f"pageSize={page_size}&"
-            f"page={page}&"
-            f"apiKey={API_KEY}"
-        )
-
-        response = requests.get(url)
-        data = response.json()
-
-        if data.get("status") != "ok" or not data.get("articles"):
+        params = {
+            "q":        query,
+            "from":     from_date,
+            "sortBy":   "publishedAt",
+            "language": "en",
+            "pageSize": 100,
+            "page":     page,
+            "apiKey":   API_KEY,
+        }
+        try:
+            response = requests.get(
+                "https://newsapi.org/v2/everything",
+                params=params, timeout=10
+            )
+            response.raise_for_status()
+            data = response.json()
+        except requests.exceptions.RequestException as e:
+            print(f"[ERROR] Request failed for '{query}': {e}")
             break
 
-        for article in data["articles"]:
-            news_list.append({
-                "Title": article.get("title"),
-                "Description": article.get("description"),
-                "Source": article["source"]["name"],
-                "Date": article.get("publishedAt")
-            })
+        if data.get("status") != "ok":
+            print(f"[ERROR] API error for '{query}': {data.get('message')}")
+            break
 
+        articles = data.get("articles", [])
+        if not articles:
+            break
+
+        for article in articles:
+            title = article.get("title", "")
+            if not title or title == "[Removed]":
+                continue
+            news_list.append({
+                "Title":       title,
+                "Description": article.get("description", ""),
+                "Source":      article.get("source", {}).get("name", "Unknown"),
+                "Date":        article.get("publishedAt", ""),
+                "URL":         article.get("url", ""),
+                "Topic":       query,
+            })
             if len(news_list) >= total_articles:
                 break
-
         page += 1
 
     return news_list
 
 
 # ==============================
-# Save to CSV (Day 6)
+# Fetch 500+ across topics
+# ==============================
+def fetch_bulk_news(topics=None, target=500):
+    if topics is None:
+        topics = DEFAULT_TOPICS
+
+    all_articles = []
+    seen_titles  = set()
+
+    print(f"[INFO] Fetching up to {target} articles across {len(topics)} topics...")
+
+    for topic in topics:
+        if len(all_articles) >= target:
+            break
+
+        remaining = target - len(all_articles)
+        per_topic = min(100, remaining)
+
+        print(f"[INFO] Topic: '{topic}' — fetching up to {per_topic}")
+        articles = fetch_news(query=topic, total_articles=per_topic)
+
+        added = 0
+        for a in articles:
+            if a["Title"] not in seen_titles:
+                seen_titles.add(a["Title"])
+                all_articles.append(a)
+                added += 1
+
+        print(f"[INFO] +{added} unique (total: {len(all_articles)})")
+
+    print(f"[INFO] Final: {len(all_articles)} unique articles")
+    return all_articles[:target]
+
+
+# ==============================
+# Save raw CSV
 # ==============================
 def save_news_to_csv(news_list):
+    if not news_list:
+        print("[WARN] No articles to save.")
+        return 0
     df = pd.DataFrame(news_list)
     df.to_csv(RAW_FILE, index=False)
+    print(f"[INFO] Saved {len(df)} raw articles → {RAW_FILE}")
     return len(df)
 
 
 # ==============================
-# Load Data (Day 7)
+# Clean data
 # ==============================
-def load_news_data(cleaned=False):
-    file_path = CLEAN_FILE if cleaned else RAW_FILE
+def clean_news_data():
+    if not os.path.exists(RAW_FILE):
+        print("[WARN] Raw file not found.")
+        return None
 
-    if os.path.exists(file_path):
-        return pd.read_csv(file_path)
+    df = pd.read_csv(RAW_FILE)
+    before = len(df)
+
+    df = df.dropna(subset=["Title"])
+    df = df.drop_duplicates(subset=["Title", "Source"])
+
+    df["Title"] = df["Title"].apply(
+        lambda t: re.sub(r"\s+", " ", str(t)).strip()
+    )
+    df["Description"] = df["Description"].fillna("").apply(
+        lambda t: re.sub(r"\s+", " ", str(t)).strip()
+    )
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"])
+    df["Date"] = df["Date"].dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    df.to_csv(CLEANED_FILE, index=False)
+    after = len(df)
+    print(f"[INFO] Cleaned: {before} → {after} ({before - after} removed)")
+    return {"before": before, "after": after, "removed": before - after}
+
+
+# ==============================
+# Load data — always prefer freshest large file
+# ==============================
+def load_news_data(cleaned=True):
+    paths = [
+        os.path.join(DATA_DIR, "news_data_cleaned.csv"),   # ← freshest after fetch
+        os.path.join(DATA_DIR, "news_raw.csv"),
+        os.path.join(DATA_DIR, "processed_news.csv"),
+        os.path.join(DATA_DIR, "milestone3_news.csv"),
+    ]
+    for p in paths:
+        if os.path.exists(p):
+            try:
+                df = pd.read_csv(p)
+                if not df.empty:
+                    return df
+            except Exception:
+                continue
     return None
 
 
 # ==============================
-# Clean Data (Day 8)
-# ==============================
-def clean_news_data():
-    df = load_news_data(cleaned=False)
-
-    if df is None:
-        return None
-
-    before_rows = len(df)
-
-    # Remove empty titles
-    df = df.dropna(subset=["Title"])
-
-    # Remove duplicates
-    df = df.drop_duplicates(subset=["Title", "Source"])
-
-    # Clean text
-    def clean_text(text):
-        text = str(text)
-        text = re.sub(r'[^\w\s]', '', text)
-        text = re.sub(r'\s+', ' ', text).strip()
-        return text
-
-    df["Title"] = df["Title"].apply(clean_text)
-
-    df.to_csv(CLEAN_FILE, index=False)
-
-    after_rows = len(df)
-
-    return {"before": before_rows, "after": after_rows}
-
-
-# ==============================
-# Analysis (Day 9)
-# ==============================
-def get_dataset_stats():
-    df = load_news_data(cleaned=True)
-
-    if df is None:
-        return None
-
-    return {
-        "total_articles": len(df),
-        "unique_sources": df["Source"].nunique(),
-        "sources": df["Source"].unique().tolist()
-    }
-
-
-# ==============================
-# Full Pipeline (Day 3–9)
+# Full pipeline
 # ==============================
 def run_full_pipeline(query="technology"):
-    news = fetch_news(query, total_articles=60)
-    saved_count = save_news_to_csv(news)
+    print(f"[INFO] Pipeline started: '{query}'")
+
+    if query.strip().lower() in ("all", "technology", ""):
+        news = fetch_bulk_news(topics=DEFAULT_TOPICS, target=500)
+    else:
+        # specific topic — fetch up to 100 (free plan limit)
+        news = fetch_news(query=query, total_articles=100)
+
+    saved_count   = save_news_to_csv(news)
     cleaning_info = clean_news_data()
-    stats = get_dataset_stats()
 
     return {
         "fetched": len(news),
-        "saved": saved_count,
-        "cleaning": cleaning_info,
-        "stats": stats
+        "saved":   saved_count,
+        "stats":   {"total_articles": saved_count, "cleaning": cleaning_info},
     }
