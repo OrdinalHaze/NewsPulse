@@ -6,5 +6,6 @@ wordcloud
 scikit-learn
 nltk
 vaderSentiment
+textblob
 requests
 python-dotenv
