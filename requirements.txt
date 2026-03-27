@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+matplotlib
+wordcloud
+scikit-learn
+nltk
+vaderSentiment
+requests
+python-dotenv
